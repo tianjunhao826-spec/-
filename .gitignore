@@ -1,0 +1,24 @@
+# 1. 虚拟环境（依赖库，几万个小文件，绝对不能传）
+.venv/
+
+# 2. 数据集（巨无霸文件，绝对不能传）
+data/
+processed_data/
+yolo_dataset/
+
+# 3. 运行产生的结果、截图和输出模型（不需要传，别人运行代码会自动生成）
+captures/
+output/
+reports/
+visualization/
+
+# 4. Python 缓存文件
+__pycache__/
+*.pyc
+*.pyo
+
+# 5. 深度学习模型权重文件（防止你把几百兆的训练结果留在了 src 目录里）
+*.pt
+*.pth
+*.onnx
+*.engine
