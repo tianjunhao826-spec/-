@@ -16,10 +16,10 @@ from PyQt5.QtGui import QImage, QPixmap, QFont
 from database import DatabaseManager
 from traffic_monitor import TrafficMonitor
 from report_generator import ReportGenerator
+import time
 
 
 class VideoThread(QThread):
-    """视频处理线程"""
     frame_ready = pyqtSignal(np.ndarray)
     finished = pyqtSignal()
 
@@ -30,17 +30,63 @@ class VideoThread(QThread):
         self.running = True
 
     def run(self):
+        import time
+
+        print("[VideoThread] 正在后台线程预热 YOLO 模型...")
+        try:
+            dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            self.monitor.model(dummy_frame, verbose=False)
+            print("[VideoThread] 预热完成，开始监控！")
+        except Exception as e:
+            print(f"模型预热出错: {e}")
+
         while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
+            if self.cap is None or not self.cap.isOpened():
                 break
-            processed = self.monitor.process_frame(frame)
-            self.frame_ready.emit(processed)
+
+            try:
+                ret, frame = self.cap.read()
+
+                # 【修复 1】：最严格的空值校验，确保 frame 存在且有维度
+                if not ret or frame is None or not hasattr(frame, 'shape'):
+                    continue  # 尝试下一帧，或者 break 取决于是否想结束
+
+                # 【修复 2】：防御性获取宽高，避免 NoneType 进入 int()
+                shape = frame.shape
+                if len(shape) < 2:
+                    continue
+
+                h, w = shape[0], shape[1]
+                target_w, target_h = 800, 500
+
+                # 确保 w, h 不是 None 且大于 0
+                if w > 0 and h > 0:
+                    scale = min(target_w / w, target_h / h)
+                    new_w, new_h = int(w * scale), int(h * scale)
+
+                    # 只有宽高合法才 resize
+                    if new_w > 0 and new_h > 0:
+                        frame = cv2.resize(frame, (new_w, new_h))
+
+                # 【修复 3】：处理过程增加异常隔离
+                processed = self.monitor.process_frame(frame)
+
+                if processed is not None and hasattr(processed, 'copy'):
+                    self.frame_ready.emit(processed.copy())
+
+            except Exception as e:
+                # 捕获具体的 NoneType 错误并跳过，防止主循环崩溃
+                if "NoneType" in str(e):
+                    pass
+                else:
+                    print(f"处理视频帧时出错: {e}")
+
+            time.sleep(0.01)
+
         self.finished.emit()
 
     def stop(self):
         self.running = False
-
 
 class MainWindow(QMainWindow):
     """
@@ -118,9 +164,12 @@ class MainWindow(QMainWindow):
                 font-size: 16px;
             }
         """)
-        self.video_label.setMinimumSize(800, 500)
+        self.video_label.setFixedSize(800, 500)
+        self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.mousePressEvent = self.mouse_callback
         self.video_label.mouseMoveEvent = self.mouse_move_callback
+        self.video_label.mouseReleaseEvent = self.mouse_release_callback
+        self.video_label.setMouseTracking(True)
         video_layout.addWidget(self.video_label)
 
         btn_layout = QHBoxLayout()
@@ -331,7 +380,7 @@ class MainWindow(QMainWindow):
         self._start_capture(0)
 
     def _start_capture(self, source):
-        """启动视频捕获"""
+        """启动视频捕获（优化版：使用多线程）"""
         self.stop_video()
 
         self.cap = cv2.VideoCapture(source)
@@ -341,13 +390,22 @@ class MainWindow(QMainWindow):
             return
 
         self.btn_stop.setEnabled(True)
-        self.timer.start(30)
-
         self.status_label.setText("监控中...")
 
+        # 【修改重点】：停止使用 QTimer，改用 VideoThread 后台线程
+        # self.timer.start(30)  <-- 删掉这行旧代码
+        self.video_thread = VideoThread(self.monitor, self.cap)
+        self.video_thread.frame_ready.connect(self.update_frame)  # 线程算完一帧，触发更新
+        self.video_thread.start()
+
     def stop_video(self):
-        """停止视频播放"""
-        self.timer.stop()
+        """停止视频播放（优化版：安全结束线程）"""
+        # self.timer.stop() <-- 删掉这行旧代码
+
+        if self.video_thread and self.video_thread.isRunning():
+            self.video_thread.stop()
+            self.video_thread.wait()  # 等待线程安全结束
+            self.video_thread = None
 
         if self.cap:
             self.cap.release()
@@ -356,71 +414,115 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.status_label.setText("已停止")
 
-    def update_frame(self):
-        """更新视频帧"""
-        if not self.cap:
-            return
+    def update_frame(self, processed_frame):
+        """更新视频帧（加入防崩溃保护）"""
+        try:
+            # 【全新不规则多边形智能渲染】
+            if self.drawing_roi:
+                # 1. 只要点数>=3，立刻实时计算并画出带荧光的智能闭合多边形
+                if len(self.roi_points) >= 3:
+                    pts = np.array(self.roi_points, dtype=np.int32)
+                    hull = cv2.convexHull(pts)
+                    cv2.polylines(processed_frame, [hull], True, (0, 255, 0), 2)
 
-        ret, frame = self.cap.read()
-        if not ret:
-            self.stop_video()
-            return
+                    overlay = processed_frame.copy()
+                    cv2.fillPoly(overlay, [hull], (0, 255, 0))
+                    cv2.addWeighted(overlay, 0.3, processed_frame, 0.7, 0, processed_frame)
 
-        frame = cv2.resize(frame, (800, 500))
+                # 2. 画出你的每一个鼠标落点（红色圆圈）
+                for p in self.roi_points:
+                    cv2.circle(processed_frame, p, 5, (0, 0, 255), -1)
 
-        processed_frame = self.monitor.process_frame(frame)
+                # 3. 鼠标还没点下时，有一条辅助黄线跟着你
+                if len(self.roi_points) > 0 and self.temp_point:
+                    cv2.line(processed_frame, self.roi_points[-1], self.temp_point, (0, 255, 255), 1)
 
-        if self.drawing_roi and len(self.roi_points) > 0:
-            for i, p in enumerate(self.roi_points):
-                cv2.circle(processed_frame, p, 5, (0, 255, 0), -1)
-                if i > 0:
-                    cv2.line(processed_frame, self.roi_points[i - 1], p, (0, 255, 0), 2)
+            # 👇👇👇 【修复核心：把丢失的画面显示代码补回来！】 👇👇👇
+            # 转换为 PyQt 图像格式并贴到界面上
+            rgb_image = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+            self.video_label.setPixmap(QPixmap.fromImage(qt_image))
 
-            if self.temp_point:
-                cv2.line(processed_frame, self.roi_points[-1], self.temp_point, (0, 255, 0), 1)
+            # 更新右下角统计数据和列表
+            if self.frame_count % 30 == 0:
+                stats = self.monitor.get_statistics()
+                self.violation_count_label.setText(f"违规次数: {stats['total_violations']}")
+                self.refresh_alert_list()
 
-        rgb_image = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(qt_image))
+            self.frame_count += 1
+            # 👆👆👆 --------------------------------------- 👆👆👆
 
-        if self.frame_count % 30 == 0:
-            stats = self.monitor.get_statistics()
-            self.violation_count_label.setText(f"违规次数: {stats['total_violations']}")
-            self.refresh_alert_list()
+        except Exception as e:
+            # 如果界面更新报错，打印真实原因，拦截 0xC0000409 闪退
+            print(f"界面更新出错 (拦截到崩溃): {e}")
 
-        self.frame_count += 1
+    def _get_real_pos(self, event):
+        """完美匹配坐标：自动计算缩放后的居中偏移量"""
+        # 获取 Label 的实际大小
+        lw, lh = self.video_label.width(), self.video_label.height()
+
+        # 获取当前显示的图片（Pixmap）大小
+        pix = self.video_label.pixmap()
+        if not pix:
+            return event.pos().x(), event.pos().y()
+
+        pw, ph = pix.width(), pix.height()
+
+        # 计算图片在黑框中的偏移量（居中对齐导致的边距）
+        offset_x = (lw - pw) // 2
+        offset_y = (lh - ph) // 2
+
+        # 转换坐标：减去偏移量，并限制在图片像素范围内
+        x = max(0, min(event.pos().x() - offset_x, pw - 1))
+        y = max(0, min(event.pos().y() - offset_y, ph - 1))
+
+        return x, y
 
     def mouse_callback(self, event):
-        """鼠标点击事件 - 绘制ROI"""
-        if self.drawing_roi:
-            x = event.pos().x()
-            y = event.pos().y()
+        """鼠标按下：在画面上自由添加点"""
+        if getattr(self, 'drawing_roi', False) and event.button() == Qt.LeftButton:
+            x, y = self._get_real_pos(event)
             self.roi_points.append((x, y))
-            self.status_label.setText(f"已添加点 {len(self.roi_points)}: ({x}, {y})")
+            self.status_label.setText(f"已添加点 {len(self.roi_points)}: ({x}, {y})，随便点，系统会自动包裹多边形！")
 
     def mouse_move_callback(self, event):
-        """鼠标移动事件"""
-        if self.drawing_roi:
-            self.temp_point = (event.pos().x(), event.pos().y())
+        """鼠标移动：动态跟随一根黄线辅助瞄准"""
+        if getattr(self, 'drawing_roi', False):
+            self.temp_point = self._get_real_pos(event)
+
+    def mouse_release_callback(self, event):
+        """自由打点模式不需要释放事件，保留个空方法防报错"""
+        pass
 
     def start_drawing(self):
-        """开始绘制ROI"""
-        if self.drawing_roi:
+        """开启不规则区域绘制 / 完成绘制"""
+        if getattr(self, 'drawing_roi', False):
+            # 点击“完成绘制”
             if len(self.roi_points) >= 3:
-                self.monitor.set_roi(self.roi_points)
+                # 【核心黑科技】：使用 ConvexHull (凸包算法) 自动修复交叉线段！
+                # 无论你按什么乱七八糟的顺序点击，它都会像橡皮筋一样从外面把所有点完美包裹起来
+                pts = np.array(self.roi_points, dtype=np.int32)
+                hull = cv2.convexHull(pts)
+                hull_points = [tuple(p[0]) for p in hull]
+
+                self.monitor.set_roi(hull_points)  # 把完美的不规则多边形传给底层
                 self.drawing_roi = False
-                self.btn_draw_roi.setText("✏️ 绘制禁停区")
-                self.status_label.setText(f"ROI设置完成: {len(self.roi_points)} 个点")
+                self.btn_draw_roi.setText("✏️ 重新绘制禁停区")
+                self.status_label.setText("✅ 不规则区域智能闭合完成！请点击【💾 保存配置】")
             else:
-                QMessageBox.warning(self, "提示", "至少需要3个点才能构成区域!")
+                self.drawing_roi = False
+                self.roi_points = []
+                self.btn_draw_roi.setText("✏️ 绘制禁停区")
+                self.status_label.setText("⚠️ 点数少于3个，已取消绘制。")
         else:
+            # 点击“绘制禁停区”
             self.drawing_roi = True
             self.roi_points = []
             self.monitor.set_roi([])
             self.btn_draw_roi.setText("✅ 完成绘制")
-            self.status_label.setText("请在视频区域点击绘制禁停区域...")
+            self.status_label.setText("👉 任意形状随便画！请在视频画面上依次【点击鼠标】打点...")
 
     def clear_roi(self):
         """清除ROI"""

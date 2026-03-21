@@ -20,6 +20,7 @@ class VehicleInfo:
         self.track_id = track_id
         self.start_time = None
         self.last_position = None
+        self.anchor_position = None
         self.duration = 0.0
         self.total_movement = 0.0
         self.plate_number = None
@@ -206,29 +207,33 @@ class TrafficMonitor:
     def _update_vehicle_in_roi(self, vehicle, center, bbox, frame, current_time):
         """
         更新ROI内车辆的状态
-        核心改进: 加入位移量判断
+        【优化版】：计算相对于初始锚点的总位移，防止将缓慢移动(堵车)误判为违停
         """
         if vehicle.start_time is None:
             vehicle.start_time = current_time
             vehicle.last_position = center
+            vehicle.anchor_position = center # 设置初始锚点
             vehicle.status = 'entering'
             vehicle.position_history = [center]
         else:
-            movement = math.sqrt(
-                (center[0] - vehicle.last_position[0]) ** 2 +
-                (center[1] - vehicle.last_position[1]) ** 2
+            # 【修改重点】：计算当前位置与'最初锚点'的距离，而不是上一帧的距离
+            total_displacement = math.sqrt(
+                (center[0] - vehicle.anchor_position[0]) ** 2 +
+                (center[1] - vehicle.anchor_position[1]) ** 2
             )
 
             vehicle.position_history.append(center)
             if len(vehicle.position_history) > 30:
                 vehicle.position_history.pop(0)
 
-            if movement > self.config['movement_threshold']:
-                vehicle.start_time = current_time
+            # 如果离开了最初设定的锚点范围，说明车辆发生明显移动（脱离堵车或重新起步）
+            if total_displacement > self.config['movement_threshold']:
+                vehicle.start_time = current_time  # 重置计时器
+                vehicle.anchor_position = center   # 更新基准锚点
                 vehicle.duration = 0
-                vehicle.total_movement += movement
                 vehicle.status = 'moving'
             else:
+                # 车辆在锚点附近未发生大幅移动，持续累加停车时间
                 vehicle.duration = current_time - vehicle.start_time
                 vehicle.status = 'parking'
 
