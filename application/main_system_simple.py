@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout,
     QHBoxLayout, QWidget, QListWidget, QFileDialog, QGroupBox,
     QSpinBox, QCheckBox, QTabWidget, QTableWidget,
-    QTableWidgetItem, QHeaderView, QMessageBox, QStatusBar
+    QTableWidgetItem, QHeaderView, QMessageBox, QStatusBar, QListWidgetItem
 )
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap
@@ -43,17 +43,246 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         self.load_roi_config()
+        self.setup_styles()
+
+    def refresh_ui_data(self):
+        # 1. 刷新状态栏的违规总数
+        if self.monitor:
+            stats = self.monitor.get_statistics()
+            self.violation_count_label.setText(f"违规次数: {stats.get('total_violations', 0)}")
+
+        # 2. 刷新告警日志列表
+        try:
+            # 从数据库获取所有违规记录
+            records = self.db.get_all_violations()
+
+            # 【核心修复】：使用字典来跟踪已经在界面上的车辆条目 {car_id: QListWidgetItem}
+            if not hasattr(self, 'alert_items_map'):
+                self.alert_items_map = {}
+                self.alert_list.clear()
+
+            # 遍历最近的 50 条记录（倒序遍历，确保越新的记录最终被推到列表越上方）
+            for record in reversed(records[:50]):
+                # 解析数据库字段 (对应 database.py 结构)
+                record_time = record[1] if len(record) > 1 else "未知时间"
+                car_id = record[2] if len(record) > 2 else "未知车辆"
+                plate = record[3] if len(record) > 3 and record[3] else "未识别"
+                duration = f"{record[6]:.1f}s" if len(record) > 6 and record[6] else "--"
+
+                # 拼接优美的展示文本
+                item_text = f"[{record_time}] 违规车辆 ID: {car_id} | 车牌: {plate} | 违停时长: {duration}"
+
+                # 判断这辆车是否已经在界面上了
+                if car_id in self.alert_items_map:
+                    # 如果在，直接【原地更新】它的文本内容（实现时间实时跳动，拒绝刷屏）
+                    self.alert_items_map[car_id].setText(item_text)
+                else:
+                    # 如果是一辆新违停的车辆，【新增】一行并插到列表最顶部
+                    new_item = QListWidgetItem(item_text)
+                    self.alert_list.insertItem(0, new_item)
+                    self.alert_items_map[car_id] = new_item
+
+        except Exception as e:
+            print(f"刷新告警日志时出错: {e}")
+
+    def setup_styles(self):
+        # 统一设置字体
+        font = self.font()
+        font.setFamily("Segoe UI, Microsoft YaHei")
+        QApplication.setFont(font)
+
+        self.setStyleSheet("""
+            /* 全局深色背景 */
+            QMainWindow {
+                background-color: #0b0f19; 
+            }
+            /* 侧边栏和模块面板背景 */
+            QWidget#panel_container {
+                background-color: #111827;
+                border-radius: 12px;
+                border: 1px solid #1f2937;
+            }
+            /* 分组框美化 */
+            QGroupBox {
+                font-size: 15px;
+                font-weight: bold;
+                color: #60a5fa; /* 亮蓝色标题 */
+                border: 1px solid #1f2937;
+                border-radius: 8px;
+                margin-top: 20px;
+                padding-top: 20px;
+                background-color: rgba(31, 41, 55, 0.3); /* 半透明背景 */
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 15px;
+                top: -5px;
+                padding: 4px 10px;
+                background-color: #1f2937; /* 标题文字背景盖住边线 */
+                color: #93c5fd;
+                border-radius: 4px;
+                border: 1px solid #374151;
+            }
+            /* 普通文本标签 */
+            QLabel {
+                color: #d1d5db;
+            }
+            /* 按钮全局样式 */
+            QPushButton {
+                background-color: #1f2937;
+                color: #e5e7eb;
+                border-radius: 6px;
+                padding: 10px 15px;
+                font-size: 14px;
+                font-weight: bold;
+                border: 1px solid #374151;
+            }
+            QPushButton:hover {
+                background-color: #374151;
+                border: 1px solid #60a5fa;
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background-color: #111827;
+            }
+            /* 主要操作按钮 (加载、打开) */
+            QPushButton#primary_btn {
+                background-color: rgba(37, 99, 235, 0.15); /* 蓝色半透明 */
+                color: #60a5fa;
+                border: 1px solid #2563eb;
+            }
+            QPushButton#primary_btn:hover {
+                background-color: rgba(37, 99, 235, 0.4);
+                border: 1px solid #93c5fd;
+                color: #ffffff;
+            }
+            /* 危险操作按钮 (停止) */
+            QPushButton#stop_btn {
+                background-color: rgba(220, 38, 38, 0.1);
+                color: #f87171;
+                border: 1px solid #dc2626;
+            }
+            QPushButton#stop_btn:hover {
+                background-color: rgba(220, 38, 38, 0.3);
+                border: 1px solid #fca5a5;
+                color: #ffffff;
+            }
+            /* 视频显示区域 */
+            QLabel#video_display {
+                background-color: #000000;
+                border: 2px solid #1e3a8a;
+                border-radius: 10px;
+                color: #4b5563;
+                font-size: 20px;
+                font-weight: bold;
+            }
+            /* 数字调节框 (SpinBox) 美化 */
+            QSpinBox {
+                background-color: #1f2937;
+                color: #60a5fa;
+                border: 1px solid #374151;
+                border-radius: 5px;
+                padding: 6px 10px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QSpinBox:focus {
+                border: 1px solid #3b82f6;
+                background-color: #111827;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #374151;
+                border-radius: 3px;
+                width: 24px;
+                margin: 1px;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #4b5563;
+            }
+            /* 选项卡美化 */
+            QTabWidget::pane {
+                border: 1px solid #1f2937;
+                border-radius: 8px;
+                background-color: #111827;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background-color: #1f2937;
+                color: #9ca3af;
+                padding: 12px 25px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                margin-right: 4px;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            QTabBar::tab:selected {
+                background-color: #2563eb;
+                color: #ffffff;
+            }
+            QTabBar::tab:hover:!selected {
+                background-color: #374151;
+            }
+            /* 列表和表格美化 */
+            QListWidget, QTableWidget {
+                background-color: transparent;
+                border: none;
+                color: #d1d5db;
+                outline: none; /* 去除点击虚线框 */
+                font-size: 13px;
+            }
+            QListWidget::item {
+                padding: 12px 8px;
+                border-bottom: 1px solid #1f2937;
+            }
+            QListWidget::item:hover {
+                background-color: rgba(55, 65, 81, 0.4);
+                border-radius: 6px;
+            }
+            QHeaderView::section {
+                background-color: #1f2937;
+                color: #9ca3af;
+                padding: 10px;
+                border: none;
+                font-weight: bold;
+                font-size: 13px;
+                border-bottom: 2px solid #2563eb;
+            }
+            /* 状态栏 */
+            QStatusBar {
+                background-color: #111827;
+                color: #9ca3af;
+                border-top: 1px solid #1f2937;
+                font-size: 12px;
+            }
+        """)
 
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
+
+        # 给主布局添加外边距
         main_layout = QHBoxLayout()
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(20)  # 左右面板的间距
 
         left_panel = self._create_left_panel()
-        main_layout.addWidget(left_panel, stretch=3)
+        # 左侧面板容器
+        left_container = QWidget()
+        left_container.setObjectName("panel_container")
+        left_layout = QVBoxLayout(left_container)
+        left_layout.setContentsMargins(15, 15, 15, 15)
+        left_layout.addWidget(left_panel)
+        main_layout.addWidget(left_container, stretch=7)  # 调整比例为 7:3
 
         right_panel = self._create_right_panel()
-        main_layout.addWidget(right_panel, stretch=1)
+        right_container = QWidget()
+        right_container.setObjectName("panel_container")
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(15, 15, 15, 15)
+        right_layout.addWidget(right_panel)
+        main_layout.addWidget(right_container, stretch=3)
 
         main_widget.setLayout(main_layout)
         self._create_status_bar()
@@ -61,83 +290,143 @@ class MainWindow(QMainWindow):
     def _create_left_panel(self):
         panel = QWidget()
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(15)
 
-        video_group = QGroupBox("实时监控")
+        video_group = QGroupBox("核心监控视角")
         video_layout = QVBoxLayout()
+        video_layout.setSpacing(15)
 
-        self.video_label = QLabel("点击'打开视频'开始监控")
+        self.video_label = QLabel("SIGNAL LOST\n等待接入监控流...")
+        self.video_label.setObjectName("video_display")
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setStyleSheet("""
-            QLabel {
-                border: 3px solid #3498db;
-                background-color: #1a1a2e;
-                color: #ffffff;
-                font-size: 16px;
-            }
-        """)
+        self.video_label.setScaledContents(True)
+        # 固定最小高度，防止界面在缩放时抖动过度
         self.video_label.setMinimumSize(800, 500)
         self.video_label.mousePressEvent = self.mouse_callback
-        video_layout.addWidget(self.video_label)
+        video_layout.addWidget(self.video_label, stretch=1)
 
+        # 操作按钮区
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(20)
 
-        self.btn_load_model = QPushButton("🔄 加载模型")
+        self.btn_load_model = QPushButton("初始化 AI 引擎")
+        self.btn_load_model.setObjectName("primary_btn")
         self.btn_load_model.clicked.connect(self.load_model)
-        btn_layout.addWidget(self.btn_load_model)
 
-        self.btn_open = QPushButton("📁 打开视频")
+        self.btn_open = QPushButton("开启监控流")
+        self.btn_open.setObjectName("primary_btn")
         self.btn_open.clicked.connect(self.open_video)
-        btn_layout.addWidget(self.btn_open)
 
-        self.btn_stop = QPushButton("⏹ 停止")
+        self.btn_stop = QPushButton("中断连接")
+        self.btn_stop.setObjectName("stop_btn")
         self.btn_stop.clicked.connect(self.stop_video)
         self.btn_stop.setEnabled(False)
+
+        btn_layout.addWidget(self.btn_load_model)
+        btn_layout.addWidget(self.btn_open)
         btn_layout.addWidget(self.btn_stop)
 
         video_layout.addLayout(btn_layout)
         video_group.setLayout(video_layout)
         layout.addWidget(video_group)
 
-        roi_group = QGroupBox("禁停区域设置")
-        roi_layout = QHBoxLayout()
+        # ======== 新增：参数调节与布控区组合 ========
+        bottom_controls_layout = QHBoxLayout()
+        bottom_controls_layout.setSpacing(15)
 
-        self.btn_draw_roi = QPushButton("✏️ 绘制禁停区")
+        # 1. 动态参数设置区
+        params_group = QGroupBox("系统参数实时调节")
+        params_layout = QHBoxLayout()
+        params_layout.setContentsMargins(15, 20, 15, 15)
+        params_layout.setSpacing(20)
+
+        # 违停阈值调节
+        parking_layout = QVBoxLayout()
+        parking_layout.setSpacing(8)
+        lbl_parking = QLabel("违停报警阈值 (秒):")
+        lbl_parking.setStyleSheet("color: #9ca3af; font-size: 13px;")
+        self.spin_parking = QSpinBox()
+        self.spin_parking.setRange(5, 600)
+        self.spin_parking.setValue(60)
+        self.spin_parking.valueChanged.connect(self.update_parking_threshold)
+        parking_layout.addWidget(lbl_parking)
+        parking_layout.addWidget(self.spin_parking)
+
+        # 位移阈值调节
+        movement_layout = QVBoxLayout()
+        movement_layout.setSpacing(8)
+        lbl_movement = QLabel("位移容忍阈值 (像素):")
+        lbl_movement.setStyleSheet("color: #9ca3af; font-size: 13px;")
+        self.spin_movement = QSpinBox()
+        self.spin_movement.setRange(10, 200)
+        self.spin_movement.setValue(60)
+        self.spin_movement.valueChanged.connect(self.update_movement_threshold)
+        movement_layout.addWidget(lbl_movement)
+        movement_layout.addWidget(self.spin_movement)
+
+        params_layout.addLayout(parking_layout)
+        params_layout.addLayout(movement_layout)
+        params_group.setLayout(params_layout)
+
+        # 2. ROI设置区
+        roi_group = QGroupBox("智能布控区域设置")
+        roi_layout = QVBoxLayout()
+        roi_layout.setContentsMargins(15, 20, 15, 15)
+        roi_layout.setSpacing(10)
+
+        self.btn_draw_roi = QPushButton("绘制警戒多边形")
         self.btn_draw_roi.clicked.connect(self.start_drawing)
-        roi_layout.addWidget(self.btn_draw_roi)
-
-        self.btn_clear_roi = QPushButton("🗑️ 清除区域")
+        self.btn_clear_roi = QPushButton("🗑清除当前配置")
         self.btn_clear_roi.clicked.connect(self.clear_roi)
+
+        roi_layout.addWidget(self.btn_draw_roi)
         roi_layout.addWidget(self.btn_clear_roi)
-
         roi_group.setLayout(roi_layout)
-        layout.addWidget(roi_group)
 
+        # 将参数区和ROI区并排放在底部
+        bottom_controls_layout.addWidget(params_group, stretch=6)
+        bottom_controls_layout.addWidget(roi_group, stretch=4)
+
+        layout.addLayout(bottom_controls_layout)
         panel.setLayout(layout)
         return panel
 
     def _create_right_panel(self):
         panel = QWidget()
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
 
         self.tab_widget = QTabWidget()
 
+        # 告警面板
         alert_tab = QWidget()
         alert_layout = QVBoxLayout()
+        alert_layout.setContentsMargins(10, 15, 10, 10)
+
+        # 科技感的告警标题
+        alert_title = QLabel("实时违规动态抓拍日志")
+        alert_title.setStyleSheet("color: #fca5a5; font-weight: bold; font-size: 15px; margin-bottom: 5px;")
+        alert_layout.addWidget(alert_title)
+
         self.alert_list = QListWidget()
-        alert_layout.addWidget(QLabel("实时违规告警记录:"))
         alert_layout.addWidget(self.alert_list)
         alert_tab.setLayout(alert_layout)
-        self.tab_widget.addTab(alert_tab, "🚨 违规记录")
+        self.tab_widget.addTab(alert_tab, "告警日志")
 
+        # 统计面板
         stats_tab = QWidget()
         stats_layout = QVBoxLayout()
+        stats_layout.setContentsMargins(10, 15, 10, 10)
         self.stats_table = QTableWidget()
         self.stats_table.setColumnCount(2)
-        self.stats_table.setHorizontalHeaderLabels(["指标", "数值"])
+        self.stats_table.setHorizontalHeaderLabels(["监控指标", "实时数据"])
         self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.stats_table.verticalHeader().setVisible(False)  # 隐藏行号
+        self.stats_table.setShowGrid(False)  # 隐藏网格线，更显高级
         stats_layout.addWidget(self.stats_table)
         stats_tab.setLayout(stats_layout)
-        self.tab_widget.addTab(stats_tab, "📊 统计分析")
+        self.tab_widget.addTab(stats_tab, "数据看板")
 
         layout.addWidget(self.tab_widget)
         panel.setLayout(layout)
@@ -146,10 +435,26 @@ class MainWindow(QMainWindow):
     def _create_status_bar(self):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_label = QLabel("请先加载模型")
+        self.status_label = QLabel("系统初始化完成 | 请先加载模型")
         self.status_bar.addWidget(self.status_label, 1)
         self.violation_count_label = QLabel("违规次数: 0")
         self.status_bar.addPermanentWidget(self.violation_count_label)
+
+    def update_parking_threshold(self, value):
+        if self.monitor:
+            try:
+                self.monitor.set_parking_threshold(value)
+                self.status_label.setText(f"违停报警阈值已更新为: {value} 秒")
+            except AttributeError:
+                pass  # 兼容部分未实现此方法的 TrafficMonitor 版本
+
+    def update_movement_threshold(self, value):
+        if self.monitor:
+            try:
+                self.monitor.set_movement_threshold(value)
+                self.status_label.setText(f"位移容忍阈值已更新为: {value} 像素")
+            except AttributeError:
+                pass
 
     def load_model(self):
         try:
@@ -159,17 +464,25 @@ class MainWindow(QMainWindow):
             from traffic_monitor import TrafficMonitor
 
             MODEL_PATH = r"C:\Users\86153\ML_Projects\day01\毕设\src\Traffic_Project\yolov10_train_v1\weights\best.pt"
+
+            # 读取当前界面 SpinBox 里的数值初始化
             config = {
-                'parking_threshold': 60,
-                'movement_threshold': 30,
+                'parking_threshold': self.spin_parking.value(),
+                'movement_threshold': self.spin_movement.value(),
+
                 'conf_threshold': 0.4,
                 'enable_enhancement': False,
-                'enable_plate_recognition': False
+                'enable_plate_recognition': False,
+
+                'max_age': 100,
+                'max_cosine_distance': 0.5,
+                'n_init': 3,
+                'skip_frames': 0
             }
 
             self.monitor = TrafficMonitor(MODEL_PATH, self.db, config)
             self.model_loaded = True
-            self.status_label.setText("模型加载完成")
+            self.status_label.setText("模型加载完成，系统就绪")
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"模型加载失败: {str(e)}")
@@ -191,14 +504,12 @@ class MainWindow(QMainWindow):
     def _start_capture(self, source):
         self.stop_video()
         self.cap = cv2.VideoCapture(source)
-
         if not self.cap.isOpened():
             QMessageBox.warning(self, "错误", "无法打开视频源!")
             return
-
         self.btn_stop.setEnabled(True)
-        self.timer.start(33)
-        self.status_label.setText("监控中...")
+        self.timer.start(5)
+        self.status_label.setText("监控流解析中...")
 
     def stop_video(self):
         self.timer.stop()
@@ -206,38 +517,77 @@ class MainWindow(QMainWindow):
             self.cap.release()
             self.cap = None
         self.btn_stop.setEnabled(False)
-        self.status_label.setText("已停止")
+        self.status_label.setText("监控已中断")
 
     def update_frame(self):
         if not self.cap or not self.monitor:
             return
+
+        self.timer.stop()  # 防止任务堆积
 
         ret, frame = self.cap.read()
         if not ret:
             self.stop_video()
             return
 
-        frame = cv2.resize(frame, (800, 500))
-        processed_frame = self.monitor.process_frame(frame)
+        try:
+            # 统一缩放尺寸
+            frame = cv2.resize(frame, (640, 480))
+            processed_frame = self.monitor.process_frame(frame)
 
-        if self.drawing_roi and len(self.roi_points) > 0:
-            for i, p in enumerate(self.roi_points):
-                cv2.circle(processed_frame, p, 5, (0, 255, 0), -1)
-                if i > 0:
-                    cv2.line(processed_frame, self.roi_points[i - 1], p, (0, 255, 0), 2)
+            # 核心保护：如果 monitor 内部出错返回 None，直接跳过渲染
+            if processed_frame is None:
+                if self.cap: self.timer.start(1)
+                return
 
-        rgb_image = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        qt_image = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(qt_image))
+            # 在这里绘制 ROI（确保坐标系都是 640x480）
+            if self.drawing_roi and len(self.roi_points) > 0:
+                for i, p in enumerate(self.roi_points):
+                    cv2.circle(processed_frame, p, 5, (0, 255, 0), -1)
+                    if i > 0:
+                        cv2.line(processed_frame, self.roi_points[i - 1], p, (0, 255, 0), 2)
 
-        self.frame_count += 1
+            # 转换为 QImage 并显示
+            rgb_image = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            # 使用 .copy() 确保内存安全
+            qt_image = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888).copy()
+            self.video_label.setPixmap(QPixmap.fromImage(qt_image))
+
+            # ====== 新增：定时刷新告警日志和统计数据 ======
+            if getattr(self, 'frame_count', 0) % 30 == 0:
+                self.refresh_ui_data()
+            self.frame_count = getattr(self, 'frame_count', 0) + 1
+            # ===============================================
+
+        except Exception as e:
+            print(f"处理出错: {e}")
+
+        if self.cap:
+            self.timer.start(1)
 
     def mouse_callback(self, event):
         if self.drawing_roi:
-            x, y = event.pos().x(), event.pos().y()
-            self.roi_points.append((x, y))
-            self.status_label.setText(f"已添加点 {len(self.roi_points)}: ({x}, {y})")
+            # 1. 获取鼠标在 Label 上的点击位置
+            ux, uy = event.pos().x(), event.pos().y()
+
+            # 2. 获取 Label 控件当前的物理尺寸
+            lw = self.video_label.width()
+            lh = self.video_label.height()
+
+            # 3. 对应 update_frame 中 resize 的目标尺寸
+            target_w, target_h = 640, 480
+
+            # 4. 精确比例换算：使用 float 运算并用 round() 四舍五入
+            real_x = int(round((ux / lw) * target_w))
+            real_y = int(round((uy / lh) * target_h))
+
+            # 5. 边界约束：防止点在边框上导致坐标为 640 或 480（超出数组索引）
+            real_x = max(0, min(real_x, target_w - 1))
+            real_y = max(0, min(real_y, target_h - 1))
+
+            self.roi_points.append((real_x, real_y))
+            self.status_label.setText(f"ROI打点 {len(self.roi_points)}: 坐标({real_x}, {real_y})")
 
     def start_drawing(self):
         if self.drawing_roi:
@@ -245,31 +595,31 @@ class MainWindow(QMainWindow):
                 if self.monitor:
                     self.monitor.set_roi(self.roi_points)
                 self.drawing_roi = False
-                self.btn_draw_roi.setText("✏️ 绘制禁停区")
-                self.status_label.setText(f"ROI设置完成: {len(self.roi_points)} 个点")
+                self.btn_draw_roi.setText("重新绘制警戒区")
+                self.status_label.setText(f"警戒区域设置完毕: 共 {len(self.roi_points)} 个控制点")
             else:
-                QMessageBox.warning(self, "提示", "至少需要3个点!")
+                QMessageBox.warning(self, "提示", "至少需要3个点才能构成多边形!")
         else:
             self.drawing_roi = True
             self.roi_points = []
             if self.monitor:
                 self.monitor.set_roi([])
-            self.btn_draw_roi.setText("✅ 完成绘制")
-            self.status_label.setText("点击绘制禁停区域...")
+            self.btn_draw_roi.setText("确认区域闭合")
+            self.status_label.setText("请在上方视频画面内点击鼠标，绘制不规则警戒多边形...")
 
     def clear_roi(self):
         self.roi_points = []
         if self.monitor:
             self.monitor.set_roi([])
         self.drawing_roi = False
-        self.btn_draw_roi.setText("✏️ 绘制禁停区")
-        self.status_label.setText("ROI已清除")
+        self.btn_draw_roi.setText("绘制警戒多边形")
+        self.status_label.setText("🗑警戒区域配置已重置")
 
     def load_roi_config(self):
         points = self.db.load_roi_config()
         if points and len(points) >= 3:
             self.roi_points = points
-            self.status_label.setText(f"已加载ROI配置: {len(points)} 个点")
+            self.status_label.setText(f"已加载历史ROI配置: {len(points)} 个控制点")
 
     def closeEvent(self, event):
         self.stop_video()

@@ -48,13 +48,13 @@ class TrafficMonitor:
         default_config = {
             'parking_threshold': 60,
             'movement_threshold': 30,
-            'conf_threshold': 0.4,
+            'conf_threshold': 0.2,
             'enable_enhancement': False,  # 默认关闭，太耗时
             'enable_plate_recognition': True,
-            'max_age': 30,
+            'max_age': 50,
             'n_init': 3,
             'max_cosine_distance': 0.3,
-            'skip_frames': 2  # 跳帧处理，每2帧处理1帧
+            'skip_frames': 0
         }
 
         self.config = {**default_config, **(config or {})}
@@ -112,13 +112,6 @@ class TrafficMonitor:
         ) >= 0
 
     def process_frame(self, frame):
-        """
-        处理单帧图像
-        Args:
-            frame: 输入帧
-        Returns:
-            processed_frame: 处理后的帧
-        """
         self.frame_count += 1
         self.stats['frames_processed'] += 1
         current_time = time.time()
@@ -149,16 +142,21 @@ class TrafficMonitor:
 
         active_track_ids = set()
 
+        # 在 process_frame 约 150 行左右的循环内
         for track in tracks:
             if not track.is_confirmed():
                 continue
 
             track_id = track.track_id
+
             active_track_ids.add(track_id)
+
+            if track.time_since_update > 0:
+                continue
 
             bbox = track.to_ltrb()
             center = self._get_center(bbox)
-            cls_id = int(track.det_conf) if hasattr(track, 'det_conf') else 0
+            cls_id = int(getattr(track, 'det_conf', 0)) if getattr(track, 'det_conf', 0) is not None else 0
 
             in_roi = self.is_point_in_roi(center)
 
@@ -181,16 +179,25 @@ class TrafficMonitor:
     def _extract_detections(self, results):
         """从YOLO结果中提取检测框"""
         detections = []
+        # 增加对 results 的保护
+        if results is None or results.boxes is None:
+            return detections
+
         for box in results.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            conf = float(box.conf[0])
-            cls_id = int(box.cls[0])
+            # 获取坐标、置信度和类别，并增加 None 保护
+            xyxy = box.xyxy[0].cpu().numpy() if box.xyxy is not None else None
+            conf_val = box.conf[0].cpu().numpy() if box.conf is not None else None
+            cls_val = box.cls[0].cpu().numpy() if box.cls is not None else None
 
-            if conf > self.config['conf_threshold']:
-                w = x2 - x1
-                h = y2 - y1
-                detections.append(([x1, y1, w, h], conf, cls_id))
+            if xyxy is not None and conf_val is not None and cls_val is not None:
+                x1, y1, x2, y2 = xyxy
+                conf = float(conf_val)
+                cls_id = int(cls_val)  # 此时 cls_val 确定不是 None
 
+                if conf > self.config['conf_threshold']:
+                    w = x2 - x1
+                    h = y2 - y1
+                    detections.append(([x1, y1, w, h], conf, cls_id))
         return detections
 
     def _get_center(self, bbox):
