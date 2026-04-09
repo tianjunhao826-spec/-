@@ -18,7 +18,7 @@
 ## 项目结构
 
 ```
-毕设/
+xiangmu/
 ├── application/                # 应用程序模块
 │   ├── main_system.py         # 主界面 (PyQt5)
 │   ├── main_system_simple.py  # 简化版主界面
@@ -138,4 +138,4 @@ MIT License
 
 ## 作者
 
-毕业设计项目
+个人开源项目
