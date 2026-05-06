@@ -463,7 +463,7 @@ class MainWindow(QMainWindow):
 
             from traffic_monitor import TrafficMonitor
 
-            MODEL_PATH = r"C:\Users\86153\ML_Projects\day01\毕设\src\Traffic_Project\yolov10_train_v1\weights\best.pt"
+            MODEL_PATH = r"C:\Users\86153\ML_Projects\day01\runs\detect\train\weights\best.pt"
 
             # 读取当前界面 SpinBox 里的数值初始化
             config = {

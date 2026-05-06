@@ -14,8 +14,6 @@ from license_plate_ocr import LicensePlateRecognizer
 
 
 class VehicleInfo:
-    """车辆信息类"""
-
     def __init__(self, track_id):
         self.track_id = track_id
         self.start_time = None
@@ -29,6 +27,9 @@ class VehicleInfo:
         self.status = 'normal'
         self.alerted = False
         self.position_history = []
+
+        # 【新增】：用于多帧投票的车牌历史库
+        self.plate_history = []
 
 
 class TrafficMonitor:
@@ -83,7 +84,7 @@ class TrafficMonitor:
         self.plate_recognizer = None
         if self.config['enable_plate_recognition']:
             try:
-                self.plate_recognizer = LicensePlateRecognizer(engine='simple')
+                self.plate_recognizer = LicensePlateRecognizer(engine='paddle')
             except Exception as e:
                 print(f"[Monitor] 车牌识别模块初始化失败: {e}")
 
@@ -244,6 +245,12 @@ class TrafficMonitor:
                 vehicle.duration = current_time - vehicle.start_time
                 vehicle.status = 'parking'
 
+                if vehicle.duration > 2.0 and not vehicle.alerted and self.frame_count % 15 == 0:
+                    if self.plate_recognizer:
+                        plate, conf = self.plate_recognizer.recognize(frame, bbox)
+                        if plate and plate != "未识别":
+                            vehicle.plate_history.append(plate)
+
             vehicle.last_position = center
 
             if vehicle.duration >= self.config['parking_threshold']:
@@ -260,16 +267,27 @@ class TrafficMonitor:
         vehicle.last_position = center
         vehicle.status = 'normal'
         vehicle.position_history = []
+        vehicle.plate_history = []  # 顺便清空历史车牌记录
 
     def _trigger_violation_alert(self, vehicle, bbox, frame):
         """触发违停告警"""
         self.stats['total_violations'] += 1
         self.alerted_ids.add(vehicle.track_id)
 
+        # ==================== DEBUG 插桩开始 ====================
+        print(f"\n[主控-拦截] 准备触发 OCR！")
+        print(f"[主控-拦截] 当前 self.plate_recognizer 的状态是: {self.plate_recognizer}")
+
         if self.plate_recognizer:
+            print("[主控-拦截] 实例存在，正式踏入 recognize 函数...")
             plate, conf = self.plate_recognizer.recognize(frame, bbox)
+            print(f"[主控-拦截] recognize 函数执行完毕，返回结果: {plate}")
             vehicle.plate_number = plate
             vehicle.plate_confidence = conf
+        else:
+            print("[主控-拦截] 🚨 致命错误：plate_recognizer 是 None！")
+            print("[主控-拦截] 🚨 这意味着 OCR 模块在程序刚启动的时候就报错崩溃了，或者配置没开启。")
+        # ==================== DEBUG 插桩结束 ====================
 
         save_path = self._save_violation_image(frame, vehicle.track_id)
 
