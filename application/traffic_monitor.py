@@ -4,6 +4,8 @@ import numpy as np
 import time
 import math
 import warnings
+from PIL import Image, ImageDraw, ImageFont
+
 warnings.filterwarnings('ignore')
 
 from ultralytics import YOLO
@@ -11,6 +13,32 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 
 from preprocessing import ImageEnhancer, FramePreprocessor
 from license_plate_ocr import LicensePlateRecognizer
+
+
+# ================= 核心工具：中文无损渲染 =================
+def cv2_put_text_chinese(img, text, position, text_color=(0, 255, 0), text_size=20):
+    """解决 OpenCV cv2.putText 无法绘制中文导致的 ??? 乱码问题"""
+    if isinstance(img, np.ndarray):
+        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    else:
+        img_pil = img
+
+    draw = ImageDraw.Draw(img_pil)
+    font_style = None
+    # 按优先级加载系统中文字体，请确保项目根目录下有 simhei.ttf
+    font_paths = ["simhei.ttf", "msyh.ttc", "simsun.ttc", "Arial Unicode.ttf"]
+    for path in font_paths:
+        try:
+            font_style = ImageFont.truetype(path, text_size, encoding="utf-8")
+            break
+        except IOError:
+            continue
+
+    if font_style is None:
+        font_style = ImageFont.load_default()
+
+    draw.text(position, text, fill=text_color, font=font_style)
+    return cv2.cvtColor(np.asarray(img_pil), cv2.COLOR_RGB2BGR)
 
 
 class VehicleInfo:
@@ -21,47 +49,48 @@ class VehicleInfo:
         self.anchor_position = None
         self.duration = 0.0
         self.total_movement = 0.0
-        self.plate_number = None
-        self.plate_confidence = 0.0
         self.vehicle_type = 'unknown'
         self.status = 'normal'
         self.alerted = False
         self.position_history = []
 
-        # 【新增】：用于多帧投票的车牌历史库
-        self.plate_history = []
+        # ================= 生命期缓存字段 =================
+        self.plate_number = None  # 记录该车生命周期内的最佳车牌
+        self.plate_confidence = 0.0  # 记录对应的最高置信度
+        self.last_ocr_time = 0.0  # 记录上次 OCR 的时间戳 (用于控制频率)
 
 
 class TrafficMonitor:
     """
     交通监控核心类
-    实现车辆检测、追踪、违停判定、车牌识别等功能
+    实现车辆检测、追踪、违停判定、生命周期车牌寻优
     """
 
-    def __init__(self, model_path, db_manager, config=None):
+    def __init__(self, model_path, plate_weights_path, db_manager, config=None):
         """
         初始化交通监控器
         Args:
-            model_path: YOLO模型路径
+            model_path: 车辆检测 YOLO 模型路径
+            plate_weights_path: 车牌定位 YOLO 模型路径
             db_manager: 数据库管理器
-            config: 配置字典
         """
         default_config = {
             'parking_threshold': 60,
             'movement_threshold': 30,
             'conf_threshold': 0.2,
-            'enable_enhancement': False,  # 默认关闭，太耗时
+            'enable_enhancement': False,
             'enable_plate_recognition': True,
             'max_age': 50,
             'n_init': 3,
             'max_cosine_distance': 0.3,
-            'skip_frames': 0
+            'skip_frames': 0,
+            'ocr_interval': 0.5  # 新增：OCR 扫描的冷却时间(秒)
         }
 
         self.config = {**default_config, **(config or {})}
         self.frame_count = 0
 
-        print(f"[Monitor] 正在加载模型: {model_path}")
+        print(f"[Monitor] 正在加载车辆检测模型: {model_path}")
         self.model = YOLO(model_path)
 
         self.tracker = DeepSort(
@@ -72,45 +101,33 @@ class TrafficMonitor:
 
         self.db = db_manager
         self.roi_points = []
-
         self.vehicles = {}
         self.alerted_ids = set()
 
         self.enhancer = ImageEnhancer()
         self.enhancer.enabled = self.config['enable_enhancement']
-
         self.preprocessor = FramePreprocessor(enable_enhancement=self.config['enable_enhancement'])
 
         self.plate_recognizer = None
         if self.config['enable_plate_recognition']:
             try:
-                self.plate_recognizer = LicensePlateRecognizer(engine='paddle')
+                # 挂载最新的两阶段 OCR 识别引擎
+                self.plate_recognizer = LicensePlateRecognizer(yolo_weights_path=plate_weights_path)
+                print("[Monitor] 级联车牌识别引擎初始化成功")
             except Exception as e:
                 print(f"[Monitor] 车牌识别模块初始化失败: {e}")
 
         self.class_names = {0: 'car', 1: 'bus', 2: 'van', 3: 'others'}
-
-        self.stats = {
-            'total_detections': 0,
-            'total_tracks': 0,
-            'total_violations': 0,
-            'frames_processed': 0
-        }
+        self.stats = {'total_detections': 0, 'total_tracks': 0, 'total_violations': 0, 'frames_processed': 0}
 
     def set_roi(self, points):
-        """设置禁停区域"""
         self.roi_points = points
         print(f"[Monitor] ROI已设置: {len(points)} 个点")
 
     def is_point_in_roi(self, point):
-        """判断点是否在ROI区域内"""
         if not self.roi_points or len(self.roi_points) < 3:
             return False
-        return cv2.pointPolygonTest(
-            np.array(self.roi_points, dtype=np.int32),
-            point,
-            False
-        ) >= 0
+        return cv2.pointPolygonTest(np.array(self.roi_points, dtype=np.int32), point, False) >= 0
 
     def process_frame(self, frame):
         self.frame_count += 1
@@ -128,28 +145,30 @@ class TrafficMonitor:
                 if vehicle.last_position:
                     bbox = [vehicle.last_position[0] - 50, vehicle.last_position[1] - 30,
                             vehicle.last_position[0] + 50, vehicle.last_position[1] + 30]
-                    self._draw_vehicle_info(processed_frame, vehicle, bbox, False)
+                    processed_frame = self._draw_vehicle_info(processed_frame, vehicle, bbox, False)
             self._draw_stats(processed_frame)
             return processed_frame
 
         results = self.model(processed_frame, verbose=False)[0]
-
         detections = self._extract_detections(results)
         self.stats['total_detections'] += len(detections)
 
         tracks = self.tracker.update_tracks(detections, frame=processed_frame)
-
         self._draw_roi(processed_frame)
 
         active_track_ids = set()
 
-        # 在 process_frame 约 150 行左右的循环内
+        # =========================================================
+        # 【算力平滑锁】：初始化为 False
+        # 记录当前这一帧的 33 毫秒内，是否已经有车辆占用了 GPU 去跑 OCR
+        # =========================================================
+        ocr_done_this_frame = False
+
         for track in tracks:
             if not track.is_confirmed():
                 continue
 
             track_id = track.track_id
-
             active_track_ids.add(track_id)
 
             if track.time_since_update > 0:
@@ -159,33 +178,58 @@ class TrafficMonitor:
             center = self._get_center(bbox)
             cls_id = int(getattr(track, 'det_conf', 0)) if getattr(track, 'det_conf', 0) is not None else 0
 
-            in_roi = self.is_point_in_roi(center)
-
             vehicle = self._get_or_create_vehicle(track_id)
             vehicle.vehicle_type = self.class_names.get(cls_id, 'unknown')
 
+            # =========================================================
+            # 【生命周期寻优逻辑（加入负载均衡与熔断限制）】
+            # =========================================================
+            if self.plate_recognizer and (current_time - vehicle.last_ocr_time > self.config['ocr_interval']):
+
+                # 条件 1：置信度低于 0.85 (未达到完美识别)
+                # 条件 2：历史识别次数不到 6 次 (防止死磕模糊车牌)
+                # 条件 3：not ocr_done_this_frame (这一帧还没其他车用过 GPU)
+                if vehicle.plate_confidence < 0.85 and getattr(vehicle, 'ocr_attempts',
+                                                               0) < 6 and not ocr_done_this_frame:
+                    # 增加历史尝试次数
+                    vehicle.ocr_attempts = getattr(vehicle, 'ocr_attempts', 0) + 1
+
+                    plate, conf = self.plate_recognizer.recognize(processed_frame, bbox)
+                    vehicle.last_ocr_time = current_time  # 刷新冷却时间
+
+                    # 锁上大门，这一帧剩余的其他车辆不许再跑 OCR
+                    ocr_done_this_frame = True
+
+                    if plate and conf > vehicle.plate_confidence:
+                        vehicle.plate_number = plate
+                        vehicle.plate_confidence = conf
+                        print(
+                            f"[寻优进行中] ID:{track_id} 暂存更优车牌: {plate} (置信度 {conf:.2f}) | 尝试次数: {vehicle.ocr_attempts}/6")
+
+                # 如果已经到达 6 次，触发熔断（不再调用模型，放过显卡）
+                elif getattr(vehicle, 'ocr_attempts', 0) == 6:
+                    vehicle.ocr_attempts += 1  # 加 1 防止这句话被重复打印
+                    print(f"[寻优熔断锁定] ID:{track_id} 已达最大尝试次数，强制锁定最终车牌: {vehicle.plate_number}")
+
+            in_roi = self.is_point_in_roi(center)
             if in_roi:
                 self._update_vehicle_in_roi(vehicle, center, bbox, processed_frame, current_time)
             else:
                 self._reset_vehicle_state(vehicle, center)
 
-            self._draw_vehicle_info(processed_frame, vehicle, bbox, in_roi)
+            processed_frame = self._draw_vehicle_info(processed_frame, vehicle, bbox, in_roi)
 
+        # 清理驶出画面的车辆释放内存
         self._cleanup_inactive_vehicles(active_track_ids)
-
         self._draw_stats(processed_frame)
 
         return processed_frame
 
     def _extract_detections(self, results):
-        """从YOLO结果中提取检测框"""
         detections = []
-        # 增加对 results 的保护
         if results is None or results.boxes is None:
             return detections
-
         for box in results.boxes:
-            # 获取坐标、置信度和类别，并增加 None 保护
             xyxy = box.xyxy[0].cpu().numpy() if box.xyxy is not None else None
             conf_val = box.conf[0].cpu().numpy() if box.conf is not None else None
             cls_val = box.cls[0].cpu().numpy() if box.cls is not None else None
@@ -193,38 +237,29 @@ class TrafficMonitor:
             if xyxy is not None and conf_val is not None and cls_val is not None:
                 x1, y1, x2, y2 = xyxy
                 conf = float(conf_val)
-                cls_id = int(cls_val)  # 此时 cls_val 确定不是 None
+                cls_id = int(cls_val)
 
                 if conf > self.config['conf_threshold']:
-                    w = x2 - x1
-                    h = y2 - y1
-                    detections.append(([x1, y1, w, h], conf, cls_id))
+                    detections.append(([x1, y1, x2 - x1, y2 - y1], conf, cls_id))
         return detections
 
     def _get_center(self, bbox):
-        """计算边界框中心点"""
         return (int((bbox[0] + bbox[2]) / 2), int((bbox[1] + bbox[3]) / 2))
 
     def _get_or_create_vehicle(self, track_id):
-        """获取或创建车辆信息"""
         if track_id not in self.vehicles:
             self.vehicles[track_id] = VehicleInfo(track_id)
             self.stats['total_tracks'] += 1
         return self.vehicles[track_id]
 
     def _update_vehicle_in_roi(self, vehicle, center, bbox, frame, current_time):
-        """
-        更新ROI内车辆的状态
-        【优化版】：计算相对于初始锚点的总位移，防止将缓慢移动(堵车)误判为违停
-        """
         if vehicle.start_time is None:
             vehicle.start_time = current_time
             vehicle.last_position = center
-            vehicle.anchor_position = center # 设置初始锚点
+            vehicle.anchor_position = center
             vehicle.status = 'entering'
             vehicle.position_history = [center]
         else:
-            # 【修改重点】：计算当前位置与'最初锚点'的距离，而不是上一帧的距离
             total_displacement = math.sqrt(
                 (center[0] - vehicle.anchor_position[0]) ** 2 +
                 (center[1] - vehicle.anchor_position[1]) ** 2
@@ -234,105 +269,75 @@ class TrafficMonitor:
             if len(vehicle.position_history) > 30:
                 vehicle.position_history.pop(0)
 
-            # 如果离开了最初设定的锚点范围，说明车辆发生明显移动（脱离堵车或重新起步）
             if total_displacement > self.config['movement_threshold']:
-                vehicle.start_time = current_time  # 重置计时器
-                vehicle.anchor_position = center   # 更新基准锚点
+                vehicle.start_time = current_time
+                vehicle.anchor_position = center
                 vehicle.duration = 0
                 vehicle.status = 'moving'
             else:
-                # 车辆在锚点附近未发生大幅移动，持续累加停车时间
                 vehicle.duration = current_time - vehicle.start_time
                 vehicle.status = 'parking'
-
-                if vehicle.duration > 2.0 and not vehicle.alerted and self.frame_count % 15 == 0:
-                    if self.plate_recognizer:
-                        plate, conf = self.plate_recognizer.recognize(frame, bbox)
-                        if plate and plate != "未识别":
-                            vehicle.plate_history.append(plate)
 
             vehicle.last_position = center
 
             if vehicle.duration >= self.config['parking_threshold']:
                 vehicle.status = 'violation'
-
                 if not vehicle.alerted:
-                    self._trigger_violation_alert(vehicle, bbox, frame)
+                    # 触发违停时直接提取缓存，无需再次运行 OCR
+                    self._trigger_violation_alert(vehicle, frame)
                     vehicle.alerted = True
 
     def _reset_vehicle_state(self, vehicle, center):
-        """重置离开ROI的车辆状态"""
         vehicle.start_time = None
         vehicle.duration = 0
         vehicle.last_position = center
         vehicle.status = 'normal'
         vehicle.position_history = []
-        vehicle.plate_history = []  # 顺便清空历史车牌记录
 
-    def _trigger_violation_alert(self, vehicle, bbox, frame):
-        """触发违停告警"""
+    def _trigger_violation_alert(self, vehicle, frame):
+        """触发违停告警，调用生命周期中记录的最高置信度车牌"""
         self.stats['total_violations'] += 1
         self.alerted_ids.add(vehicle.track_id)
 
-        # ==================== DEBUG 插桩开始 ====================
-        print(f"\n[主控-拦截] 准备触发 OCR！")
-        print(f"[主控-拦截] 当前 self.plate_recognizer 的状态是: {self.plate_recognizer}")
-
-        if self.plate_recognizer:
-            print("[主控-拦截] 实例存在，正式踏入 recognize 函数...")
-            plate, conf = self.plate_recognizer.recognize(frame, bbox)
-            print(f"[主控-拦截] recognize 函数执行完毕，返回结果: {plate}")
-            vehicle.plate_number = plate
-            vehicle.plate_confidence = conf
-        else:
-            print("[主控-拦截] 🚨 致命错误：plate_recognizer 是 None！")
-            print("[主控-拦截] 🚨 这意味着 OCR 模块在程序刚启动的时候就报错崩溃了，或者配置没开启。")
-        # ==================== DEBUG 插桩结束 ====================
-
+        # 核心：直接提取最佳记录
+        final_plate = vehicle.plate_number if vehicle.plate_number else "未知车牌(识别失败)"
         save_path = self._save_violation_image(frame, vehicle.track_id)
 
         self.db.insert_violation(
             car_id=f"Car_{vehicle.track_id}",
             image_path=save_path,
-            plate_number=vehicle.plate_number,
+            plate_number=final_plate,
             duration=vehicle.duration,
             vehicle_type=vehicle.vehicle_type
         )
 
-        print(f"[ALERT] 违停告警! ID={vehicle.track_id}, "
-              f"车牌={vehicle.plate_number}, 停留={vehicle.duration:.1f}秒")
+        print(f"[ALERT] 违停告警! ID={vehicle.track_id}, 车牌={final_plate}, 停留={vehicle.duration:.1f}秒")
 
     def _save_violation_image(self, frame, track_id):
-        """保存违规截图"""
         captures_dir = "captures"
         if not os.path.exists(captures_dir):
             os.makedirs(captures_dir)
-
         filename = f"violation_{track_id}_{int(time.time())}.jpg"
         save_path = os.path.join(captures_dir, filename)
-
         cv2.imwrite(save_path, frame)
         return save_path
 
     def _cleanup_inactive_vehicles(self, active_ids):
-        """清理不活跃的车辆"""
+        """清理驶离画面车辆，利用 del 实现内存自动回收"""
         inactive_ids = [tid for tid in self.vehicles if tid not in active_ids]
         for tid in inactive_ids:
             if tid in self.vehicles:
                 del self.vehicles[tid]
 
     def _draw_roi(self, frame):
-        """绘制ROI区域"""
         if len(self.roi_points) > 2:
             pts = np.array(self.roi_points, dtype=np.int32)
             cv2.polylines(frame, [pts], True, (0, 0, 255), 2)
-
             overlay = frame.copy()
             cv2.fillPoly(overlay, [pts], (0, 0, 255))
             cv2.addWeighted(overlay, 0.1, frame, 0.9, 0, frame)
 
     def _draw_vehicle_info(self, frame, vehicle, bbox, in_roi):
-        """绘制车辆信息"""
         x1, y1, x2, y2 = map(int, bbox)
         center = self._get_center(bbox)
 
@@ -351,41 +356,34 @@ class TrafficMonitor:
         if vehicle.plate_number:
             label += f" | {vehicle.plate_number}"
 
-        cv2.putText(frame, label, (x1, y1 - 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        # 核心：使用 PIL 替代 cv2.putText 绘制完美中文
+        frame = cv2_put_text_chinese(frame, label, (x1, max(0, y1 - 25)), text_color=color, text_size=20)
 
         if in_roi and vehicle.duration > 0:
             time_text = f"{vehicle.duration:.1f}s"
             if vehicle.status == 'violation':
                 time_text = f"VIOLATION! {time_text}"
-            cv2.putText(frame, time_text, (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            frame = cv2_put_text_chinese(frame, time_text, (x1, max(0, y1 - 45)), text_color=color, text_size=18)
 
         cv2.circle(frame, center, 4, (255, 0, 0), -1)
 
         if len(vehicle.position_history) > 1:
             for i in range(1, len(vehicle.position_history)):
-                cv2.line(frame,
-                         vehicle.position_history[i - 1],
-                         vehicle.position_history[i],
-                         (255, 255, 0), 1)
+                cv2.line(frame, vehicle.position_history[i - 1], vehicle.position_history[i], (255, 255, 0), 1)
+        return frame
 
     def _draw_stats(self, frame):
-        """绘制统计信息"""
         stats_text = [
             f"Frames: {self.stats['frames_processed']}",
             f"Tracks: {len(self.vehicles)}",
             f"Violations: {self.stats['total_violations']}"
         ]
-
         y_offset = 30
         for text in stats_text:
-            cv2.putText(frame, text, (10, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(frame, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             y_offset += 25
 
     def get_statistics(self):
-        """获取统计数据"""
         return {
             **self.stats,
             'active_vehicles': len(self.vehicles),
@@ -393,28 +391,29 @@ class TrafficMonitor:
         }
 
     def set_enhancement(self, enabled):
-        """设置图像增强开关"""
         self.enhancer.enabled = enabled
         self.preprocessor.set_enhancement(enabled)
 
     def set_parking_threshold(self, seconds):
-        """设置违停时间阈值"""
         self.config['parking_threshold'] = seconds
 
     def set_movement_threshold(self, pixels):
-        """设置位移阈值"""
         self.config['movement_threshold'] = pixels
 
 
 if __name__ == "__main__":
     print("交通监控模块测试...")
 
+
     class MockDB:
         def insert_violation(self, **kwargs):
             print(f"[MockDB] 插入记录: {kwargs}")
 
+
+    # 注意初始化时的参数变更，需传入车辆模型与车牌模型两个路径
     monitor = TrafficMonitor(
         model_path=r"C:\Users\86153\ML_Projects\day01\毕设\src\Traffic_Project\yolov10_train_v1\weights\best.pt",
+        plate_weights_path=r"C:\Users\86153\ML_Projects\day01\runs\detect\train\weight\best.pt",
         db_manager=MockDB()
     )
 
